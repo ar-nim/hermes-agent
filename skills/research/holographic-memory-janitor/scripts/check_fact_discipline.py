@@ -1,85 +1,57 @@
-#!/usr/bin/env python3
 """
 check_fact_discipline.py — enforces holographic-memory best-practices rules.
 
-Design principles (per upstream review, 2026-07-29):
+Design principles:
 - NO shipped wordlist, NO regex guessing of "which words are entities".
-- The single-word entity check set is DERIVED FROM THE STORE: we query
-  fact_entities for entities that are single tokens (no spaces). Those are the
-  only words the linter expects to be quoted. Common capitalized words
-  (Python, Linux, Monday) are simply not in the store as entities, so they are
-  never flagged -> zero false positives.
-- If the store has no single-word entities yet (cold start), the linter cannot
-  lint quoting -> it reports that LLM judgment applies (the agent decides what
-  is an entity). No tokens spent.
-- hrr_dim is READ FROM config.yaml (dimension-agnostic) -> never hardcoded.
+- The single-word entity check set is DERIVED FROM THE STORE.
+- hrr_dim is read from MemoryStore (dimension-agnostic) — never hardcoded.
+- Uses MemoryStore shared connection (NOT sqlite3.connect).
 
-Checks performed:
-  1. Single-word-entity quoting: any single-word entity already in the store
-     that appears UNQUOTED in the draft content -> FAIL (with the fact_id that
-     established it, for context).
-  2. Category enum: draft category must be in {user_pref, project, tool, general}.
-  3. Per-bank capacity: WARN if a category exceeds hrr_dim/4 facts (SNR degrade).
-  4. HRR homogeneity: FAIL if any category has mixed hrr_vector byte lengths.
+Checks:
+  1. Single-word-entity quoting (dry-run + store audit)
+  2. Category enum validation
+  3. Per-bank capacity (SNR degrade warning)
+  4. HRR vector byte-length homogeneity
 
 Usage:
-  python3 check_fact_discipline.py --dry-run --content '...' --category user_pref
-      -> pre-write check of a proposed fact (content + category).
-  python3 check_fact_discipline.py --store
-      -> post-write audit of the whole store (janitor mode).
-  python3 check_fact_discipline.py --json
-      -> machine-readable output.
+  --dry-run --content '...' --category user_pref  → pre-write check
+  --store                                          → full store audit
+  --json                                           → machine-readable
+  --db /path/to/test.db                            → override DB path
 
-Exit codes:
-  0 = clean (or only warnings)
-  1 = violations found (FAIL)
-  2 = cold store (no single-word entities; LLM judgment path)
+Exit codes: 0=clean, 1=violations, 2=cold store
 """
 import argparse
 import json
 import os
 import re
-import sqlite3
 import sys
 from pathlib import Path
+
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+_AGENT_DIR = HERMES_HOME / "hermes-agent"
+_HOLO_DIR = _AGENT_DIR / "plugins" / "memory" / "holographic"
+for _p in [str(_HOLO_DIR), str(_AGENT_DIR)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 EXPECTED_CATEGORIES = ("user_pref", "project", "tool", "general")
 
 
-def find_db() -> Path:
-    hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
-    return Path(hermes_home) / "memory_store.db"
+def get_store(db_path=None):
+    """Get a MemoryStore using the plugin's shared connection."""
+    from store import MemoryStore
+    if db_path is None:
+        db_path = str(HERMES_HOME / "memory_store.db")
+    return MemoryStore(db_path=db_path)
 
 
-def read_hrr_dim() -> int:
-    """Read hrr_dim from config.yaml (dimension-agnostic). Default 1024."""
-    cfg = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))) / "config.yaml"
-    if cfg.exists():
-        text = cfg.read_text(errors="ignore")
-        m = re.search(r"hrr_dim\s*:\s*(\d+)", text)
-        if m:
-            return int(m.group(1))
-    return 1024
+def read_hrr_dim(store) -> int:
+    """Read hrr_dim from MemoryStore (dimension-agnostic)."""
+    return store.hrr_dim
 
 
 def get_single_word_entities(conn, min_facts: int = 3) -> list:
-    """
-    Derive the check set from the store: single-token entity names (no spaces)
-    joined from fact_entities -> entities. These are the only words we expect to
-    be quoted. No regex, no shipped list.
-
-    Precision: only KEEP single-word entities that are TitleCase (Arif, Depakote)
-    or ALL-CAPS acronyms (GCP, KTP, WIB) AND bound in >= min_facts facts.
-    The frequency floor separates curated entities (agent quoted them repeatedly)
-    from extraction artifacts (This, Aug, Agent, home -- bound in 1-2 facts only).
-
-    A minimal GENERIC STOPWORD set (words that are never entities, regardless of
-    frequency -- e.g. months, articles, common nouns) is excluded. This is NOT a
-    user-entity wordlist; it is a tiny universal blocklist of non-entities so the
-    linter never flags 'April' or 'Agent'. User-specific entities are still derived
-    from the store only.
-    """
-    # Generic non-entities: months, articles, common nouns. Universal, no PII.
     STOPWORDS = {
         "april", "may", "june", "jul", "aug", "sep", "sept", "september",
         "oct", "nov", "dec", "jan", "feb", "mar",
@@ -110,15 +82,9 @@ def get_single_word_entities(conn, min_facts: int = 3) -> list:
 
 
 def unquoted_occurrence(content: str, entity: str) -> bool:
-    """
-    Return True if `entity` appears in content WITHOUT surrounding double quotes.
-    Word-boundary aware (pitfall #28: substring matching false positives).
-    """
-    # quoted form: "entity" anywhere
     quoted = f'"{entity}"'
     if quoted in content:
         return False
-    # unquoted occurrence with word boundaries
     return bool(re.search(r"(?<![\w\"])" + re.escape(entity) + r"(?![\w\"])", content))
 
 
@@ -131,7 +97,6 @@ def check_dry_run(content: str, category: str, entities: list) -> dict:
             "detail": f"category '{category}' not in {EXPECTED_CATEGORIES}",
         })
     if not entities:
-        # cold store -> LLM judgment path
         return {
             "store_has_single_word_entities": False,
             "llm_judgment_required": True,
@@ -186,7 +151,6 @@ def audit_store(conn, hrr_dim: int) -> dict:
                 "rule": "per-bank-capacity", "severity": "WARN",
                 "category": cat, "total": total, "limit": hrr_dim // 4,
             })
-        # per-fact quoting check for single-word entities
         for r in rows:
             c = r["content"] or ""
             for ent in entities:
@@ -201,36 +165,32 @@ def audit_store(conn, hrr_dim: int) -> dict:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true", help="check a proposed fact")
+    ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--content", default=None)
     ap.add_argument("--category", default=None)
-    ap.add_argument("--store", action="store_true", help="audit whole store")
+    ap.add_argument("--store", action="store_true")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--db", default=None)
     args = ap.parse_args()
 
-    db = find_db()
-    if not db.exists():
-        print("ERROR: memory_store.db not found at", db, file=sys.stderr)
-        sys.exit(2)
-    conn = sqlite3.connect(str(db))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=ON")
-    hrr_dim = read_hrr_dim()
+    store = get_store(args.db)
+    hrr_dim = read_hrr_dim(store)
 
     if args.dry_run:
         if not args.content or not args.category:
             print("ERROR: --dry-run requires --content and --category", file=sys.stderr)
+            store.close()
             sys.exit(2)
-        entities = get_single_word_entities(conn)
-        result = check_dry_run(args.content, args.category, entities)
-        conn.close()
+        with store._lock:
+            entities = get_single_word_entities(store._conn)
+            result = check_dry_run(args.content, args.category, entities)
+        store.close()
         if args.json:
             print(json.dumps(result, indent=2))
         else:
             if result.get("llm_judgment_required"):
                 print("COLD STORE: no single-word entities in store yet.")
                 print("-> LLM judgment applies for entity selection (no lint possible).")
-                print("-> category check:", "OK" if args.category in EXPECTED_CATEGORIES else f"FAIL ({args.category})")
             elif result["problems"]:
                 print("FAIL — quoting/category violations:")
                 for p in result["problems"]:
@@ -240,13 +200,13 @@ def main():
         sys.exit(1 if result["problems"] else 0)
 
     if args.store:
-        report = audit_store(conn, hrr_dim)
-        conn.close()
+        with store._lock:
+            report = audit_store(store._conn, hrr_dim)
+        store.close()
         if args.json:
             print(json.dumps(report, indent=2))
         else:
             print(f"hrr_dim={hrr_dim}  capacity/fact per bank={hrr_dim//4}")
-            print(f"single-word entities in store ({report['single_word_entity_count']}): {report['single_word_entities']}")
             fails = [p for p in report["problems"] if p["severity"] == "FAIL"]
             warns = [p for p in report["problems"] if p["severity"] == "WARN"]
             for p in report["problems"]:
@@ -260,8 +220,8 @@ def main():
             print(f"\n{len(fails)} FAIL, {len(warns)} WARN")
         sys.exit(1 if fails else 0)
 
-    # default: nothing specified
     print("Usage: --dry-run --content '...' --category X  |  --store  [--json]", file=sys.stderr)
+    store.close()
     sys.exit(2)
 
 

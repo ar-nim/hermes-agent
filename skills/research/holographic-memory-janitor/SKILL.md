@@ -19,14 +19,14 @@ metadata:
 
 ## Overview
 
-The janitor is the **corrective maintenance layer** for the holographic fact store. It is interactive and reactive — it fixes problems flagged by the user or by automated trigger checks (e.g., seed anchors below trust threshold). It asks before every action and produces an end-of-session summary of what was done.
+The janitor is the **corrective maintenance layer** for the holographic fact store. It is interactive and reactive — it fixes problems flagged by the user or by automated trigger checks (e.g., entity binding rates below threshold). It asks before every action and produces an end-of-session summary of what was done.
 
 Unlike the reflect skill (generative, autonomous, cron-triggered), the janitor is directed by the user and operates on existing facts. Both are operationally distinct — they cannot be merged.
 
 ## When to Use
 
 - User says "run the janitor" or "run holographic memory maintenance"
-- Automated trigger reports seed anchors below threshold
+- Entity binding audit reports entities below healthy threshold
 - User asks to clean up, audit, or review the holographic memory store
 - After a data-corruption incident or bad reflect run
 - User says "reranking audit" or "audit memory" → run Pass 8 (4-Way Reranking Audit)
@@ -132,37 +132,48 @@ Verify:
 
 If anything deviates from `store.py`, report it before proceeding.
 
-## Pre-Flight: Bank Integrity Check
+## Pre-Flight: HRR Vector Health Check
 
-**Run this BEFORE the seed anchor check.** A corrupt bank makes every subsequent `probe()` and `add` fail with a confusing numpy error.
+**Run this before any pass.** A corrupt bank makes every subsequent `probe()` and `add` fail with a confusing numpy error.
 
 ```bash
-python3 skills/holographic-memory-janitor/scripts/check_bank_integrity.py
+python3 skills/holographic-memory-janitor/scripts/check_hrr_health.py
 ```
 
-Per-category byte-length audit of `hrr_vector`. Expected byte length is `hrr_dim * 8` (float64) — read `hrr_dim` from config.yaml; do NOT hardcode 4096. At the 1024-dim default this is 8192 bytes; at 4096-dim it is 32768.
+This merged script detects both failure modes:
+1. **Inhomogeneous byte-length vectors** (wrong dimensionality → numpy "inhomogeneous shape" error on bank rebuild)
+2. **NULL hrr_vectors** (silently excluded from bank rebuilds — invisible to `probe()`/`reason()`)
+
+Expected byte length is `hrr_dim * 8` (float64), read from MemoryStore — never hardcoded. At the 1024-dim default this is 8192 bytes.
+
 ```
-user_pref: 227 vectors, byte_lens={32768: 224, 8192: 3} ✗ CORRUPT
-  #831 byte_len=8192 (expected 32768)
+hrr_dim=1024  expected_bytes=8192
+  user_pref: 227 vectors, {32768B: 224, 8192: 3} ✗ CORRUPT
+    #831 byte_len=8192 (expected 32768)
+  general: 3 fact(s) with NULL hrr_vector (invisible to HRR)
 ```
-**If corruption is detected:** stop and run Pass 0 before any other pass. See `references/bank-corruption-diagnosis.md` for the full root-cause analysis.
 
-Also run `scripts/check_null_hrr_vectors.py` (per-category `hrr_vector IS NULL` audit) when the byte-length check returns clean — catches the silent "excluded from bank" failure mode.
+**If corruption or NULLs detected:** stop and run Pass 1 before any other pass. See `references/bank-corruption-diagnosis.md` for the full root-cause analysis.
 
-## Pre-Flight: Seed Anchor Trigger Check
+## Pre-Flight: Entity Binding Rate Check
 
-Determine if the janitor is needed:
+Run the store-derived entity binding audit to identify entities with poor binding rates:
 ```bash
-python3 skills/holographic-memory-janitor/scripts/check_anchors.py
+python3 skills/holographic-memory-janitor/scripts/check_entity_bindings.py
 ```
-```
-ConditionA: 0.000 (TRIGGER) — 0/45 bound, threshold=0.9, gap=0.9, critical=True
-```
-If all anchors OK → "All anchors healthy." If triggers found → report to user for an interactive janitor session.
+Entities are derived from the store (`fact_entities` with frequency floor ≥ 3), not a hardcoded list. Rate = bound_facts / fts_mentions.
 
-**The "0 seed anchors" case:** "Found 0 seed anchors" + "All anchors healthy" is NOT a clean bill of health — it is a silent false-negative. Stores without seed anchors must rely on other pre-flight signals (bank integrity, FTS drift, entity density). Do not skip pre-flight just because the anchor check returned a green line.
+```
+  ConditionA: 0.081 (CRITICAL) — 3/37 bound
+  MedicationB: 0.107 (CRITICAL) — 3/28 bound
+```
 
-**Recovery when anchors are missing:** re-seed them as `seed_anchor` facts (content `seed_anchor: <Name>, threshold=0.85, critical=<true|false>`). Pick names from the top-N entities by `bound_count`; do not re-derive thresholds from a vacuum.
+**Interpretation:**
+- Rate ≥ 0.85: OK
+- Rate 0.70–0.85: WARNING — investigate unbound facts
+- Rate < 0.70: CRITICAL — significant binding gap
+
+If entities are flagged → report to user for an interactive janitor session (Pass 2: Entity Binding Audit).
 
 ## Pre-Flight: Orphan Bank Row Audit
 
@@ -211,7 +222,7 @@ For each category, execute passes in order. Complete one pass before starting th
 **Procedure — the "last update succeeds" pattern:**
 `update_fact()` runs in this order: (1) `UPDATE facts SET content=...`; (2) re-extract + re-link entities if `content is not None`; (3) `_compute_hrr_vector()` — **commits a fresh vector at the correct dim BEFORE the bank rebuild**; (4) `_rebuild_bank()` — **may FAIL while any sibling vector is still wrong-dim**. So even when `update` returns the rebuild error, the targeted fact's vector is already recomputed at the correct dim. Only the FINAL update (removing the last outlier) returns `{"updated": true}`. The first N-1 errors are expected and non-fatal.
 
-For each corrupt fact returned by `check_bank_integrity.py`:
+For each corrupt fact returned by `check_hrr_health.py`:
 ```bash
 fact_store(action='update', fact_id=<N>, content=<verbatim current content>)
 ```
@@ -220,7 +231,7 @@ fact_store(action='update', fact_id=<N>, content=<verbatim current content>)
 
 **Completion criteria:**
 ```bash
-python3 scripts/check_bank_integrity.py   # → "All banks homogeneous."
+python3 scripts/check_hrr_health.py   # → "All vectors homogeneous and non-null."
 sqlite3 "$HERMES_HOME/memory_store.db" \
   "SELECT bank_name, dim, fact_count, length(vector) FROM memory_banks WHERE bank_name='cat:user_pref'"
 # length(vector) = hrr_dim * 8 — read hrr_dim from config.yaml
@@ -232,26 +243,15 @@ fact_store(action='remove', fact_id=<new_id>)
 
 ### Pass 1: Entity Extraction Hygiene
 
+### Pass 2: Entity Binding Audit
+
+**Purpose:** Identify entities with poor binding rates (mentioned in fact content but not linked via `fact_entities`). Uses `check_entity_bindings.py` (store-derived entity list).
+
 **Problem:** Unquoted entities are never extracted by `_extract_entities()` — they get zero HRR binding. Every fact containing an important entity must quote it in its content.
 
-**Seed anchors** are the primary enforcement target — stored as facts tagged `seed_anchor` (not hardcoded). To add/remove one, use `fact_store add/remove`.
+**Diagnosis:** run `check_entity_bindings.py` to identify store-derived entities with low binding rates (bound_facts / fts_mentions < 0.85).
 
-**Per-entity miss-rate (the real metric):** global unbound percentage is a vanity metric. For each seed anchor, compute bound/total:
-```python
-import sqlite3, os
-conn = sqlite3.connect(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")) + "/memory_store.db")
-conn.row_factory = sqlite3.Row
-conn.execute("PRAGMA query_only=ON")
-# seed_anchors loaded from store (facts WHERE tags LIKE '%seed_anchor%')
-for name, threshold, seed_fid in seed_anchors:
-    total = conn.execute("SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH ? AND rowid != ?", (f'"{name}"', seed_fid)).fetchone()[0]
-    bound = conn.execute("SELECT COUNT(*) FROM fact_entities fe JOIN entities e ON e.entity_id=fe.entity_id WHERE e.name=?", (name,)).fetchone()[0]
-    rate = round(bound/total, 3) if total > 0 else None
-    print(f"{name}: {rate} ({bound}/{total})")
-```
-If `bound/total < threshold` for any anchor → trigger.
-
-**Word-boundary rule:** use `(?<!\")\\bentity\\b(?!\"])` — don't match already-quoted entities, don't treat substrings as matches.
+**Word-boundary rule:** use `(?<!\")\bentity\b(?!")` — don't match already-quoted entities, don't treat substrings as matches.
 
 **Empirical finding:** content containing an entity name does NOT mean it is bound in `fact_entities`. Always verify binding via direct SQL JOIN, never infer from content. Single-word capitalized / ALL CAPS terms (`User`, `ConditionA`, `MedicationB`, `InsurerC`, `LocalTZ`) are NOT auto-extracted by `_RE_CAPITALIZED` (requires 2+ title-case words) — they must be explicitly double-quoted.
 
@@ -636,9 +636,11 @@ When using an LLM to **decompose, extract, or synthesize** facts:
 
 ## Scripts
 
-- `scripts/check_anchors.py` — per-anchor bound/total ratio check. Re-runnable; surfaces seed anchors below threshold.
-- `scripts/check_bank_integrity.py` — per-category HRR vector byte-length audit. Detects inhomogeneous-shape bank corruption. Run in every pre-flight BEFORE the seed-anchor check. Exit 0 = clean, 1 = corruption.
-- `scripts/check_null_hrr_vectors.py` — per-category `hrr_vector IS NULL` audit. Complements the byte-length check; catches reflect-pipeline writes committed without a vector.
+All scripts use MemoryStore shared connection and `--db` flag for testing.
+
+- `scripts/check_hrr_health.py` — HRR vector integrity audit. Detects inhomogeneous byte-lengths (bank corruption) and NULL vectors (invisible to HRR). Uses MemoryStore, dimension-agnostic. Exit 0 = healthy, 1 = problems.
+- `scripts/check_entity_bindings.py` — entity binding rate audit. Derives entity list from the store (frequency floor ≥ 3), computes bound/fts_mentions rate. Exit 0 = all OK, 1 = entities below threshold.
+- `scripts/check_fact_discipline.py` — pre-write quoting linter and full store audit. Store-derived entity check, dimension-agnostic capacity warning, HRR homogeneity check. Supports `--dry-run`, `--store`, `--json`.
 
 ---
 
