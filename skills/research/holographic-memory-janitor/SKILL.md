@@ -6,7 +6,7 @@ description: >-
   audit (fact verification against session history, skills, optional wiki,
   and fact_store self-consistency). Corrective and reactive. For autonomous
   synthesis, use holographic-memory-reflect instead.
-version: 2.7.0
+version: 2.8.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -79,145 +79,65 @@ if not os.path.isdir(profile_dir):
 
 ---
 
-## Pre-Flight: WAL Lock Check
+## Pre-Flight: DB Health
 
-Before starting, check for uncommitted WAL transactions:
-```bash
-fuser "$HERMES_HOME/memory_store.db"
-ls -la "$HERMES_HOME/memory_store.db-wal"
-```
+Before any pass, verify the database is accessible and structurally sound.
 
-**WAL safety with MemoryStore shared connection.** The holographic memory plugin (`store.py:98-112`) uses a process-wide shared connection pool. All `MemoryStore` instances for the same DB share ONE connection with a re-entrant lock — cross-connection WAL contention is impossible. Janitor audit scripts that open their own `sqlite3.connect()` with `PRAGMA query_only=ON` are still safe (WAL allows concurrent readers), but prefer the shared connection when writing. See `reflect_pipeline.get_store()` for the canonical pattern.
-
-**Stale WAL + new gateway PID = false positive.** A PID in `fuser` output does not always mean the gateway is actively writing. If the WAL timestamp predates the current gateway session, the lock may be stale. Always verify with a MemoryStore read-only query:
+**1. WAL safety.** The MemoryStore shared connection (`store.py:98-112`) eliminates cross-connection WAL contention. Verify connectivity:
 ```bash
 python3 -c "
 from store import MemoryStore
-import os
 store = MemoryStore()
-count = store._conn.execute('SELECT COUNT(*) FROM facts').fetchone()[0]
-print('READ OK,', count, 'facts')
+print('READ OK,', store._conn.execute('SELECT COUNT(*) FROM facts').fetchone()[0], 'facts')
 store.close()
 "
 ```
-If the read succeeds → WAL is stale; proceed. If it fails with `database is locked` → gateway holds exclusive write lock → tell user to restart gateway, wait, retry.
+If the read fails with `database is locked` → gateway restart race → tell the user, wait. **⚠️ NEVER restart the gateway yourself.**
 
-**⚠️ NEVER restart the gateway yourself.** The user has explicitly forbidden gateway restarts by the agent. When a genuine lock is detected, tell the user and wait for them to restart, then retry.
+**2. Schema verification.**
+```python
+from store import MemoryStore
+store = MemoryStore()
+rows = store._conn.execute("SELECT sql FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+for r in rows: print(r[0])
+store.close()
+```
+Verify: `content TEXT NOT NULL UNIQUE`, tables (`facts`, `entities`, `fact_entities`, `facts_fts`, `memory_banks`), FTS triggers.
 
-## Pre-Flight: Load Full Best-Practices
-
-Before beginning, load the operating engine:
+**3. Load best-practices.**
 ```bash
 skill_view(name='holographic-memory-best-practices')
 ```
 
-## Pre-Flight: Schema Verification
+## Pre-Flight: Entity Health
 
-Verify the actual DB schema matches `store.py` before starting. All janitor recommendations (hard deletes, deprecations, splits) depend on the schema behaving as expected.
-```python
-from store import MemoryStore
-import os
-store = MemoryStore()
-rows = store._conn.execute("SELECT sql FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
-for r in rows:
-    print(r[0])
-store.close()
-```
-**Critical path distinction:** always use `$HERMES_HOME/memory_store.db` (SQLite) in cron. The `DuckDB` file at a different path yields "Table with name facts does not exist".
+**1. HRR vector integrity** — run `check_hrr_health.py` to detect inhomogeneous byte-length vectors (bank corruption) and NULL vectors (invisible to HRR). If corruption detected → stop and run Pass 0.
 
-Verify:
-1. `content TEXT NOT NULL UNIQUE` — the UNIQUE constraint is the deduplication mechanism
-2. Tables: `facts`, `entities`, `fact_entities`, `facts_fts`, `memory_banks`
-3. FTS triggers present and correct
+**2. Entity binding rates** — run `check_entity_bindings.py` to identify store-derived entities with poor binding rates (bound/fts_mentions < 0.85). If entities flagged → Pass 1 investigates.
 
-If anything deviates from `store.py`, report it before proceeding.
-
-## Pre-Flight: HRR Vector Health Check
-
-**Run this before any pass.** A corrupt bank makes every subsequent `probe()` and `add` fail with a confusing numpy error.
-
-```bash
-python3 skills/holographic-memory-janitor/scripts/check_hrr_health.py
-```
-
-This merged script detects both failure modes:
-1. **Inhomogeneous byte-length vectors** (wrong dimensionality → numpy "inhomogeneous shape" error on bank rebuild)
-2. **NULL hrr_vectors** (silently excluded from bank rebuilds — invisible to `probe()`/`reason()`)
-
-Expected byte length is `hrr_dim * 8` (float64), read from MemoryStore — never hardcoded. At the 1024-dim default this is 8192 bytes.
-
-```
-hrr_dim=1024  expected_bytes=8192
-  user_pref: 227 vectors, {32768B: 224, 8192: 3} ✗ CORRUPT
-    #831 byte_len=8192 (expected 32768)
-  general: 3 fact(s) with NULL hrr_vector (invisible to HRR)
-```
-
-**If corruption or NULLs detected:** stop and run Pass 1 before any other pass. See `references/bank-corruption-diagnosis.md` for the full root-cause analysis.
-
-## Pre-Flight: Entity Binding Rate Check
-
-Run the store-derived entity binding audit to identify entities with poor binding rates:
-```bash
-python3 skills/holographic-memory-janitor/scripts/check_entity_bindings.py
-```
-Entities are derived from the store (`fact_entities` with frequency floor ≥ 3), not a hardcoded list. Rate = bound_facts / fts_mentions.
-
-```
-  ConditionA: 0.081 (CRITICAL) — 3/37 bound
-  MedicationB: 0.107 (CRITICAL) — 3/28 bound
-```
-
-**Interpretation:**
-- Rate ≥ 0.85: OK
-- Rate 0.70–0.85: WARNING — investigate unbound facts
-- Rate < 0.70: CRITICAL — significant binding gap
-
-If entities are flagged → report to user for an interactive janitor session (Pass 2: Entity Binding Audit).
-
-## Pre-Flight: Orphan Bank Row Audit
-
-The schema enum only allows `category IN ('user_pref', 'project', 'tool', 'general')`. Post-migration, `memory_banks` rows for `cat:financial` / `cat:health` may be left behind as orphans (bank_name present, zero facts reference it).
-
-**Detection:**
-```python
-banks = [r["bank_name"] for r in conn.execute("SELECT bank_name FROM memory_banks").fetchall()]
-for b in banks:
-    cat = b.replace("cat:", "")
-    count = conn.execute("SELECT COUNT(*) FROM facts WHERE category = ?", (cat,)).fetchone()[0]
-    if count == 0:
-        print(f"ORPHAN: {b} (0 facts)")
-```
-**Cleanup:** Direct SQL DELETE on `memory_banks` is acceptable for orphan rows (no facts to migrate, no vector to recompute) — this is the one case where direct SQL writes are correct:
-```python
-conn.execute("DELETE FROM memory_banks WHERE bank_name IN ('cat:financial', 'cat:health')")
-conn.commit()
-```
+**3. Category size check** — per-category counts. Above 500 facts the contradiction gate is unreliable; keep below 300. See `references/audit-procedures.md` § Category Size Escalation Protocol.
 
 ---
 
 ## DB Access Rules
 
-- **MemoryStore shared connection** — the holographic memory plugin (store.py:98-112) uses a process-wide shared connection pool. All MemoryStore instances share ONE connection with a re-entrant lock, eliminating cross-connection WAL contention. The gateway, janitor scripts, and reflect pipeline all join this pool when they use get_store() / MemoryStore(db_path=...).
+- **MemoryStore shared connection** — the holographic memory plugin (store.py:98-112) uses a process-wide shared connection pool. All MemoryStore instances share ONE connection with a re-entrant lock, eliminating cross-connection WAL contention.
 - **All writes** → fact_store tool (uses gateway's own connection, available in interactive sessions).
 - **Simple reads (probe, search)** → fact_store tool.
-- **Cron environment reads** → terminal with sqlite3 CLI or a MemoryStore script (preferred). The sqlite3 CLI is a standalone binary, not flagged as script execution.
-- **Cron execution pattern blocks (verified):** execute_code, inline python3 -c, and rm /tmp/... are BLOCKED in cron. Use sqlite3 $HERMES_HOME/.hermes/memory_store.db "SQL" or write a script to /tmp/x.py and run python3 /tmp/x.py.
-- **WAL safety:** the shared connection eliminates cross-process WAL contention (see WAL pre-flight section above). Never restart the gateway yourself.
-- **Two-phase fix for entity quoting:** Phase 1 (bulk quoting via SQLite SQL) computes new quoted content strings for all unbound facts; Phase 2 (`fact_store update` per fact) is mandatory — it triggers `_extract_entities()` AND `_compute_hrr_vector()`. Never skip Phase 2 (`fact_entities` and `hrr_vector` are separate; correct links without a fresh HRR vector still score poorly). The UNIQUE constraint hazard: if two facts share content after quoting, differentiate (append a parenthetical) before updating both.
-- **Exception — Pass 1 discovery only:** the entity density JOIN query has no built-in tool equivalent; `execute_code` is acceptable strictly for discovery, not verification or fixes.
+- **Cron environment reads** → terminal with sqlite3 CLI or a MemoryStore script (preferred).
+- **WAL safety:** the shared connection eliminates cross-process WAL contention. Never restart the gateway yourself.
+- **Two-phase fix for entity quoting:** Phase 1 (bulk quoting via SQL) computes new quoted content strings; Phase 2 (`fact_store update` per fact) is mandatory — it triggers `_extract_entities()` AND `_compute_hrr_vector()`. Never skip Phase 2.
+- **Exception — Pass 1 discovery only:** the entity density JOIN query has no built-in tool equivalent; `execute_code` is acceptable strictly for discovery, not fixes.
 
 ---
 
 ## The Janitor Loop
 
-For each category, execute passes in order. Complete one pass before starting the next. **Pass 0 runs only if the bank integrity pre-flight flagged corruption.** Skip it on a clean store. **Pass 8 (4-Way Reranking Audit) is store-wide rather than per-category** — run it as the closing pass of a full janitor session, or standalone when the user asks for a "reranking audit".
+For each category, execute passes in order. Complete one pass before starting the next. **Pass 0 runs only if the HRR health pre-flight flagged corruption.** Skip it on a clean store. **Pass 8 (4-Way Reranking Audit) is store-wide** — run it as the closing pass, or standalone when the user asks for a "reranking audit".
 
 ### Pass 0: Bank Integrity Repair
 
 **Problem:** a fact has `hrr_vector` at a different dimensionality (in bytes / 8) than the rest of the bank. When `_rebuild_bank()` bundles vectors, numpy rejects the inhomogeneous list; every subsequent `add` / `update` / `probe` in that category fails with `setting an array element with a sequence. The requested array has an inhomogeneous shape after 1 dimensions.`
-
-**Root cause:** the `holographic-memory-reflect` pipeline instantiated `HolographicStore()` without reading `hrr_dim` from `config.yaml`, so the constructor default (`store.py:105: hrr_dim: int = 1024`) won, writing vectors at a different `hrr_dim` than the bank (e.g. the 1024-dim constructor default into a config-set 4096-dim bank, or vice-versa).
 
 **Procedure — the "last update succeeds" pattern:**
 `update_fact()` runs in this order: (1) `UPDATE facts SET content=...`; (2) re-extract + re-link entities if `content is not None`; (3) `_compute_hrr_vector()` — **commits a fresh vector at the correct dim BEFORE the bank rebuild**; (4) `_rebuild_bank()` — **may FAIL while any sibling vector is still wrong-dim**. So even when `update` returns the rebuild error, the targeted fact's vector is already recomputed at the correct dim. Only the FINAL update (removing the last outlier) returns `{"updated": true}`. The first N-1 errors are expected and non-fatal.
@@ -227,52 +147,19 @@ For each corrupt fact returned by `check_hrr_health.py`:
 fact_store(action='update', fact_id=<N>, content=<verbatim current content>)
 ```
 
-**Do not pre-emptively modify the content.** `update_fact` has no byte-equality check (guard is `if content is not None`); passing the verbatim current string DOES trigger recompute. The myth that "byte-identical content skips recompute" is false — the guard is `content is not None`, not a diff check. (To fix dimension corruption, pass the verbatim content; the vector is rewritten at the correct dim.)
+**Do not pre-emptively modify the content.** `update_fact` has no byte-equality check (guard is `if content is not None`); passing the verbatim current string DOES trigger recompute.
 
 **Completion criteria:**
 ```bash
 python3 scripts/check_hrr_health.py   # → "All vectors homogeneous and non-null."
-sqlite3 "$HERMES_HOME/memory_store.db" \
-  "SELECT bank_name, dim, fact_count, length(vector) FROM memory_banks WHERE bank_name='cat:user_pref'"
-# length(vector) = hrr_dim * 8 — read hrr_dim from config.yaml
-fact_store(action='probe', entity='"User"', category='user_pref', limit=3)   # works
-fact_store(action='add', content='test', category='user_pref', tags='test')
-fact_store(action='remove', fact_id=<new_id>)
 ```
-**Prevention:** the reflect pipeline must read `hrr_dim` from `config.yaml` before instantiating `HolographicStore()`. See `references/bank-corruption-diagnosis.md` for the full RCA.
+**Prevention:** the reflect pipeline must read `hrr_dim` from `config.yaml` before instantiating `MemoryStore()`. See `references/bank-corruption-diagnosis.md` for the full RCA.
 
-### Pass 1: Entity Extraction Hygiene
+### Pass 1: Entity Extraction & Binding Audit
 
-### Pass 2: Entity Binding Audit
+**Purpose:** Identify entities with poor binding rates and facts with zero entity bindings. Both reduce HRR retrieval quality — unquoted entities get zero binding, making facts invisible to `probe()` / `reason()`.
 
-**Purpose:** Identify entities with poor binding rates (mentioned in fact content but not linked via `fact_entities`). Uses `check_entity_bindings.py` (store-derived entity list).
-
-**Problem:** Unquoted entities are never extracted by `_extract_entities()` — they get zero HRR binding. Every fact containing an important entity must quote it in its content.
-
-**Diagnosis:** run `check_entity_bindings.py` to identify store-derived entities with low binding rates (bound_facts / fts_mentions < 0.85).
-
-**Word-boundary rule:** use `(?<!\")\bentity\b(?!")` — don't match already-quoted entities, don't treat substrings as matches.
-
-**Empirical finding:** content containing an entity name does NOT mean it is bound in `fact_entities`. Always verify binding via direct SQL JOIN, never infer from content. Single-word capitalized / ALL CAPS terms (`User`, `ConditionA`, `MedicationB`, `InsurerC`, `LocalTZ`) are NOT auto-extracted by `_RE_CAPITALIZED` (requires 2+ title-case words) — they must be explicitly double-quoted.
-
-**Fix:** For each unbound fact, ask the user to quote the entity; bulk approval ("yes to all") covers a group.
-```
-[JANITOR] #<fact_id> — unquoted entities: <list>
-Content: "<current content>"
-Entity bindings: <list from SQL — may be empty even though content mentions the entity>
-Fix: quote each unquoted entity name in content
-Action needed: YES to apply / NO to skip
-```
-
-**Completion criteria:** Pass 1 fixes verified via `probe()` (and `fact_entities` SQL JOIN) before moving on; per-anchor bound/total at or above threshold.
-
-### Pass 1b: Bulk Entity Binding (Zero-Entity Facts)
-
-**Problem:** Facts with zero `fact_entities` bindings (written before extraction worked, or with no extractable entities) are invisible to `probe()` / `reason()` / `related()`, and cause bank count mismatches. Scale: can exceed 100 facts in a mature store.
-
-**Root cause:** `_RE_CAPITALIZED` requires 2+ capitalized words. Single-word terms (`User`, `ConditionA`, `MedicationB`, `InsurerC`, `LocalTZ`, `GCP`) are not auto-extracted — must be explicitly double-quoted.
-
-**Detection:**
+**Diagnosis:** run `check_entity_bindings.py` to identify store-derived entities with low binding rates. Also scan for zero-entity facts:
 ```python
 import sqlite3, os
 conn = sqlite3.connect(os.environ.get('HERMES_HOME', os.path.expanduser('~/.hermes')) + '/memory_store.db')
@@ -285,16 +172,17 @@ for cat in ('user_pref', 'general', 'tool', 'project'):
     print(f"{cat}: {len(rows)} zero-entity facts")
 ```
 
-**Fix procedure:**
-1. Identify facts with no double-quoted terms and no multi-word title-case phrases.
-2. Add double quotes around the most important entity (e.g. `"User"` for user_pref, `"EmployerE"` for work facts).
-3. `fact_store update` with quoted content → triggers `_extract_entities()` → `_resolve_entity()` → `_link_fact_entity()` → `_compute_hrr_vector()`.
-4. Batch 5-10 per tool call.
-5. Verify bindings via `fact_entities` SQL after each batch.
+**Problem:** Unquoted entities are never extracted by `_extract_entities()` — they get zero HRR binding. Every fact containing an important entity must quote it in its content. Single-word capitalized / ALL CAPS terms (`User`, `ConditionA`, `MedicationB`, `InsurerC`, `LocalTZ`) are NOT auto-extracted by `_RE_CAPITALIZED` (requires 2+ title-case words) — they must be explicitly double-quoted.
 
-**Critical (verified):** `update_fact` recomputes HRR vector + re-extracts entities on ANY `content` argument — the guard is `if content is not None`, NOT byte-equality. There is **no byte-equality skip**. The June-20 observation (181 "updates" with identical content produced no bindings) happened because the **same unquoted** text re-extracts deterministically to empty. To add bindings you must **ADD THE QUOTES**. So: pass `content` with the quotes added; passing byte-identical unquoted content returns `{"updated": true}` but yields no new bindings (the recompute ran, found nothing new).
+**Word-boundary rule:** use `(?<!\")\bentity\b(?!")` — don't match already-quoted entities, don't treat substrings as matches.
 
-**Completion criteria:** zero-entity facts now have `fact_entities` rows (verified via SQL JOIN) and fresh HRR vectors.
+**Empirical finding:** content containing an entity name does NOT mean it is bound in `fact_entities`. Always verify binding via direct SQL JOIN, never infer from content.
+
+**Fix:** For each unbound fact, add double quotes around the most important entity. `fact_store update` with quoted content triggers `_extract_entities()` → `_resolve_entity()` → `_link_fact_entity()` → `_compute_hrr_vector()`. Batch 5-10 per tool call. Verify bindings via `fact_entities` SQL after each batch.
+
+**Critical (verified):** `update_fact` recomputes on ANY `content` argument — the guard is `if content is not None`, NOT byte-equality. Passing byte-identical unquoted content returns `{"updated": true}` but yields no new bindings (the recompute ran, found nothing new). To add bindings you must **ADD THE QUOTES**.
+
+**Completion criteria:** Pass 1 fixes verified via `probe()` and `fact_entities` SQL JOIN; binding rates at or above threshold.
 
 ### Pass 2: Bundled Facts (Atomicity Violations)
 
@@ -308,9 +196,7 @@ for cat in ('user_pref', 'general', 'tool', 'project'):
 
 **MANDATORY: show raw content before asking.** Present the exact content and entities via SQL; never pre-filter or summarize. The user decides conceptual-coupling vs format-bundling.
 
-**Pass 1 pre-check before any `fact_store update`:** if two facts share the same content string, the later update fails with `UNIQUE constraint failed`. Differentiate (append a parenthetical) before updating.
-
-**Mega-bundle cleanup:** (1) search the store for each component; (2) track — already-an-atom (no action) / genuinely-new (save standalone) / partial-overlap (offer rewrite, don't deprecate without saving); (3) deprecate the mega-bundle only after all new components are secured; (4) do NOT re-bundle existing atoms. Extracted atoms start at trust 0.4 (tag `unverified-source`) until user-confirmed → 0.5.
+**Pre-check before any `fact_store update`:** if two facts share the same content string, the later update fails with `UNIQUE constraint failed`. Differentiate (append a parenthetical) before updating.
 
 **Fix:** present raw content, ask split / keep / specify.
 
@@ -320,7 +206,7 @@ for cat in ('user_pref', 'general', 'tool', 'project'):
 
 **Problem:** Related claims scattered across multiple facts that should travel together.
 
-**Procedure:** Present raw content (not tables — tables strip context) for each candidate and let the user decide merge / keep separate / deprecate. Verify bundle components against the store via `probe()` / `search()` before presenting a demotion (a prior session may have partially atomized).
+**Procedure:** Present raw content (not tables — tables strip context) for each candidate and let the user decide merge / keep separate / deprecate. Verify bundle components against the store via `probe()` / `search()` before presenting a demotion.
 
 **FTS drift check:**
 ```python
@@ -344,7 +230,7 @@ print(f"Drift: {drift}, Orphaned FTS: {orphaned}, Missing FTS: {missing}")
 
 **Passive holding-area rule:** Tombstones are NOT a maintenance queue. Only act with a concrete reason: a clear higher-trust duplicate, a confirmed harmful factual error, or a merge opportunity. Do NOT systematically "clean" the 0.3 tier.
 
-**Hard-delete-first rule:** prefer `fact_store remove` (reclaims the full vector slot). Deprecate (`fact_feedback unhelpful`) only when the old fact has specific historical query value. Pre-compute the target trust before mass deprecation: each `unhelpful` subtracts 0.10, so from 0.3 deprecate once for a 0.1 floor, at most 3× for full deprecation; better, use `fact_store update(fact_id, trust_delta=-X)` to set the target directly.
+**Hard-delete-first rule:** prefer `fact_store remove` (reclaims the full vector slot). Deprecate (`fact_feedback unhelpful`) only when the old fact has specific historical query value. Pre-compute the target trust before mass deprecation: each `unhelpful` subtracts 0.10; better, use `fact_store update(fact_id, trust_delta=-X)` to set the target directly.
 
 **Fix:** ask the user per candidate (DELETE / LEAVE AS-IS).
 
@@ -355,26 +241,11 @@ print(f"Drift: {drift}, Orphaned FTS: {orphaned}, Missing FTS: {missing}")
 **Purpose:** Detect outdated facts, flag superseded sequences, propose trajectory updates. The plugin has no built-in temporal reasoning; this pass scans content strings for ISO 8601 dates.
 
 **Procedure:**
-1. Scan content for `\\b\\d{4}-\\d{2}-\\d{2}\\b`.
+1. Scan content for `\b\d{4}-\d{2}-\d{2}\b`.
 2. Group facts by shared entity (via `fact_entities` / `probe()`).
 3. For each entity with ≥2 dated facts, sort by embedded date.
 4. Flag sequences where a newer fact contradicts an older one without trajectory format.
 5. Propose update with Trajectory Format: `"[New state] (previously: [old state])"`.
-
-**Implementation (computation-only, no LLM):**
-```python
-import re, sqlite3, os
-from datetime import datetime
-conn = sqlite3.connect(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")) + "/memory_store.db")
-conn.row_factory = sqlite3.Row
-conn.execute("PRAGMA query_only=ON")
-ISO_DATE = re.compile(r'\b(\d{4}-\d{2}-\d{2})\b')
-dated = []
-for row in conn.execute("SELECT fact_id, content FROM facts").fetchall():
-    ds = sorted(set(ISO_DATE.findall(row['content'])))
-    if ds: dated.append({'fact_id': row['fact_id'], 'dates': ds})
-# group by entity via fact_entities, then for each entity with >=2 facts sort and flag
-```
 
 **Issue format:**
 ```
@@ -400,14 +271,6 @@ Action needed: YES to apply / NO to skip
 
 **⚠️ SQLite REGEXP is NOT available — use Python `re`.** Any `WHERE content REGEXP ?` crashes with `no such function: REGEXP`. Fetch rows into Python, apply `re.search()`.
 
-**Issue format:**
-```
-[JANITOR] #<fact_id> — potential coreference
-Content: "<current content>"
-Detected alias: "<alias>" for entity "<canonical>"
-Proposed binding: "<canonical> aka <alias>"
-Action needed: YES to add binding / NO to skip
-```
 **RULE: Never auto-create bindings. Always ask.**
 
 **Completion criteria:** proposed bindings confirmed by the user before any write.
@@ -416,7 +279,7 @@ Action needed: YES to add binding / NO to skip
 
 **Purpose:** Identify facts never retrieved (`retrieval_count` increments on search/probe/related/reason — observability ONLY, never scoring/ranking). These facts may need HRR recompute, entity re-quoting, or pruning.
 
-**Prerequisite:** `retrieval_count` must be incrementing (confirm via `SELECT MAX(retrieval_count) FROM facts` > 0). If zero on all facts, the PR #73901 fix may not be deployed — skip this pass.
+**Prerequisite:** `retrieval_count` must be incrementing (confirm via `SELECT MAX(retrieval_count) FROM facts` > 0). If zero on all facts, the fix may not be deployed — skip this pass.
 
 **Procedure:**
 ```bash
@@ -436,14 +299,14 @@ For each zero-retrieval fact, diagnose: entity not quoted? (recommend `fact_stor
 
 ### Pass 8: 4-Way Reranking Audit
 
-**Purpose:** Systematic audit of facts against four independent sources for accuracy, staleness, and contradictions. Designed for periodic maintenance (monthly/quarterly) or triggered by major life events (EmploymentTransition, marriage, relocation) that stale entire clusters of facts at once. Broader than the Trust Reweighting Audit below: it can also remove and update facts, not just nudge trust.
+**Purpose:** Systematic audit of facts against four independent sources for accuracy, staleness, and contradictions. Designed for periodic maintenance (monthly/quarterly) or triggered by major life events that stale entire fact clusters.
 
 Full batch mechanics and validated workflow: `references/four-way-reranking-audit.md`.
 
 **Sources (authority order):**
 1. **Session history** — what the user explicitly said/confirmed (`session_search`)
 2. **Skills** — ground-truth schedules, endpoints, cron IDs, protocols (`skill_view`)
-3. **Optional external wiki (llm-wiki)** — if installed, compiled knowledge from default + profile wikis. Skip if no wiki is configured.
+3. **Optional external wiki (llm-wiki)** — if installed. Skip if no wiki is configured.
 4. **Fact_store** — self-consistency via `contradict()` and `reason()`
 
 **Method — for each candidate fact,** query ALL four sources and assign a signal:
@@ -451,10 +314,10 @@ Full batch mechanics and validated workflow: `references/four-way-reranking-audi
 | Signal | Meaning | Action |
 |--------|---------|--------|
 | ✅ Corroborated | multiple sources agree | `fact_feedback(action='helpful')` — promotes trust |
-| ⚠️ Mixed/Silent/Sensitive | unclear or health-related | NO CHANGE — hold (see Trust Reweighting critical rule 2) |
+| ⚠️ Mixed/Silent/Sensitive | unclear or health-related | NO CHANGE — hold |
 | 🔴 Contradicted | sources disagree | `fact_feedback(action='unhelpful')`; if content wrong, flag for update |
 | 💀 Obsolete | no longer applies to current reality | `fact_store(action='remove')` — user-approved only |
-| 🔄 Update | content changed | `fact_store(action='update')` with Trajectory Format: "[Current] (previously [Old])" |
+| 🔄 Update | content changed | `fact_store(action='update')` with Trajectory Format |
 
 **Candidate tiers:**
 - **A. High trust (≥0.55):** verify they're still correct
@@ -462,106 +325,31 @@ Full batch mechanics and validated workflow: `references/four-way-reranking-audi
 - **C. Low trust (0.20–0.35):** zombie facts to re-verify or hard-delete
 
 **Hard rules:**
-1. **Dry-run table FIRST.** Never execute without user approval (same discipline as the Trust Reweighting Audit's 5-phase pattern).
-2. **Sensitive-health (MedicationB, ConditionA, dosing): HOLD.** Requires explicit confirmation — see Health Facts Are Sacred below.
+1. **Dry-run table FIRST.** Never execute without user approval.
+2. **Sensitive-health (MedicationB, ConditionA, dosing): HOLD.**
 3. **Synthesis ceiling: 0.45 max.** Never outrank component facts.
 4. **`fact_feedback` only moves trust.** Wrong content needs `fact_store update`.
 5. **Stale ≠ wrong.** Check before demoting.
-6. **Cross-profile:** PartnerWiki often more current on life-event/relationship facts.
-7. **Batch size: 10–20 facts/session max.** Don't overwhelm.
+6. **Batch size: 10–20 facts/session max.**
 
-**Dry-run table format:**
-```markdown
-| fact_id | Content (80 chars) | Trust | Evidence | Proposed | Rationale |
-```
+**Common patterns:** Life Event Staleness, Redundancy Detection, Wiki-Memory Reconciliation (optional), Synthesis Fact Rescoring — see `references/four-way-reranking-audit.md` for full details.
 
-**Execution:** Pre-audit — `fact_store list` inventory, `contradict()` per category, `session_search` for recent confirmations, `skill_view` for cross-reference. During — per 10–20-fact batch: cross-reference all 4 sources → build dry-run table → user approval → execute → boost verified facts → trajectory-format updates. Post — summary report (audited/boosted/demoted/updated/removed/held), flag cross-source drift for followup (wiki-sync only if a wiki is configured).
-
-**Common patterns:**
-
-- **Life Event Staleness.** A major life event stales whole clusters simultaneously — EmploymentTransition: commute facts, work schedule, office location, compensation, employment status; marriage: girlfriend/Partner references, single-status assumptions; relocation: home location, transit routes, weather zone. Approach: recognize the cluster, demote the whole group, update the canonical identity fact, consolidate history into fewer, richer facts.
-- **Redundancy Detection.** Same content in multiple facts, subset relationships (fact A fully contained in fact B), near-duplicate quotes across fact IDs. Keep the most comprehensive/specific version; demote the rest.
-- **Wiki-Memory Reconciliation (optional — only if llm-wiki is installed).** fact_store is source of truth; the wiki is the compiled, human-readable version. After fact updates, propagate: `entities/<name>.md` (identity, career), `index.md` (summary lines), `log.md` (audit trail). Skip entirely if no wiki is configured. See also Cross-Store Drift Reconciliation below.
-- **Synthesis Fact Rescoring.** Rescore `reflect-synthesis` facts (trust 0.30–0.40) when real-world events validate them, they duplicate another synthesis fact, or they become moot. Ceiling: 0.45 — never outrank component facts.
-
-**Pass 8 pitfalls:**
-
-- **Don't demote career facts post-EmploymentTransition.** Work experience is career capital for job seeking. Consolidate scattered work facts into one comprehensive career summary; demote purely operational facts (monitoring dashboards, daily schedule); keep tech stack, achievements, scope — these feed resume/application material.
-- **Health Facts Are Sacred.** MedicationB, ConditionA, dosing, interactions — never demote or update without explicit user confirmation (Trust Reweighting critical rule 2). Mark HOLD and move on.
-- **Policy facts need user clarification.** Insurance policy types (critical illness vs life vs health) may be ambiguous. Always ask before modifying policy/financial facts.
-- **Commute expiry ≠ contract expiry.** A contract may say "last day [DATE]" but the person stopped commuting at announcement. Don't assume commute facts are valid until contract end — ask "When did you last actually commute?"
+**Pass 8 pitfalls:** Don't demote career facts post-EmploymentTransition (consolidate, don't delete). Health Facts Are Sacred (never without explicit confirmation). Policy facts need user clarification. Commute expiry ≠ contract expiry.
 
 **Completion criteria:** dry-run table approved before execution; sensitive-health facts held; synthesis facts below 0.45; summary report delivered.
 
 ---
 
-## Defense in Depth: Entity Drift Prevention
+## Audit Procedures (Reference)
 
-**Layer 1 — Real-Time Gate (pre-write, governed by holographic-memory-best-practices):** before every `fact_store add`, probe the canonical entity name; search for aliases; use the canonical name in content; flag missing canonical for Layer 2.
+The following procedures are NOT sequential passes but discrete operations:
 
-**Layer 2 — Periodic Janitor Scan (interactive):** for each suspected alias pair, intersect dual `probe()` result sets:
-```python
-probe_a = set(f['fact_id'] for f in fact_store(action='probe', entity='"<NameA>"')['facts'])
-probe_b = set(f['fact_id'] for f in fact_store(action='probe', entity='"<NameB>"')['facts'])
-if probe_a & probe_b:  # same entity under two names → migrate to canonical
-```
-**Layer 3 — Encoding Fixes (extraction failures):** entity never quoted at write-time → quote it via `fact_store update`; the call re-runs `_extract_entities()` and creates the binding.
+- **Trust Reweighting Audit** (`fact_feedback` dry-run) — 5-phase pattern for nudging trust scores
+- **Cross-Store Drift Reconciliation** — propagating fact corrections to wikis/vaults
+- **Category Size Escalation Protocol** — per-category thresholds (300 warning, 500 emergency)
+- **Defense in Depth: Entity Drift Prevention** — 3-layer alias detection
 
-## Trust Reweighting Audit (`fact_feedback` dry-run)
-
-A discrete janitor operation (NOT a pass in the 0–8 sequence, and NOT the reflect pipeline which *writes* new facts at trust 0.3). Runs when the user asks to "train" or "audit" the store. Output: `fact_feedback` calls that nudge `trust_score`. For the broader 4-source audit that can also remove/update facts, use Pass 8.
-
-**The 5-phase pattern (verified):**
-| Phase | Action | Tool |
-|-------|--------|------|
-| 1. Gather | Pull candidate facts grouped by entity, ordered by `probe` score | `fact_store probe "<Entity>" limit=N` |
-| 2. Cross-check sessions | What User actually said/confirmed | `session_search` (read-only) |
-| 3. Cross-check external wiki(s) [optional] | If llm-wiki installed: canonical record — default + profile wikis | `search_files` (read-only); skip if no wiki |
-| 4. Dry-run table | fact_id, current trust, evidence, proposed action, rationale | `clarify` (user) |
-| 5. Execute | One `fact_feedback` per approved row | `fact_feedback` |
-
-**Critical rules:**
-1. **Always dry-run, never batch-write.** Present the full table, get approval, then execute. `fact_feedback` is irreversible without a backup.
-2. **Hard rule against moving sensitive-health claims.** Missed-dose / adherence claims require explicit user time/timestamp confirmation. Do not move on inference alone.
-3. **`fact_feedback` is NOT for content updates.** Wrong date/budget/ROM → `fact_store update` (triggers re-extraction + HRR recompute). `fact_feedback` only nudges trust.
-4. **Stale ≠ untrustworthy.** A 5-week-old fact about a broken system may still be correct — archive or update, don't demote.
-5. **Duplicates need the janitor, not fact_feedback.** Pick a canonical, `fact_store remove` the other.
-6. **Cross-check sibling profile wikis [if configured].** When profile wikis exist, the shared profile wiki is often *more* current than `default` on shared facts.
-7. **`helpful`/`unhelpful` deltas are small but real** (~0.05–0.1). Multiple corroborating calls compound.
-
-**Output format:**
-```
-| fact_id | Current | Evidence signal | Proposed | Rationale |
-| 335 | 0.50 | 🔴 Contradicted (shared wiki + 3 sessions) | unhelpful | Wrong date AND budget |
-```
-Use ✅ (confirmed), ⚠️ (mixed/sensitive/hold), 🔴 (contradicted).
-**Cost preview:** N `fact_feedback` writes, 0 `fact_store` writes, 0 integrity check needed.
-
-## Cross-Store Drift Reconciliation (follow-up to reweighting audit)
-
-`fact_feedback` only touches fact_store. When the audit surfaces a fact whose content disagrees with the user's **other configured stores** (default wiki if llm-wiki is installed, profile wikis, external note vaults (e.g. Joplin, Obsidian) if present), the trust nudge is the first step, not the end.
-
-**The 4-step recipe (verified):**
-1. **Audit all configured stores** for the stale claim — `grep` across whichever wikis/vaults exist (skip stores that aren't set up).
-2. **Establish source-of-truth** explicitly (newer sources generally supersede older; sibling wiki, when present, often more current on shared facts).
-3. **Patch each existing store top-to-bottom:** `fact_store` (trust via `fact_feedback` / content via `fact_store update`) → default wiki (`patch`, if installed) → sibling wikis (if any) → schema/index (`last_updated` bump). Only patch stores that actually exist.
-4. **Document the de-dup convention** (e.g. `concepts/wiki-coordination.md`) so it doesn't recur.
-
-**What this is NOT:** not a merge (multi-profile privacy boundary); not a fact_store-only job (wiki reconciliation needs `llm-wiki` installed — skip the wiki half if absent); not automatic (drift in an unqueried store won't be caught).
-
----
-
-## Category Size Escalation Protocol
-
-In `retrieval.py:381`, `_MAX_CONTRADICT_FACTS = 500`. Above 500 facts per category, only the 500 most recently updated are checked for contradictions — oldest facts become permanently invisible to the contradiction detector.
-
-| Category size | Status | Action |
-|---|---|---|
-| 0–300 | Healthy | Normal operation |
-| 300–499 | Warning | Flag; begin aggressive hard-delete of low-trust deprecated facts |
-| 500+ | Emergency | Contradiction gate compromised; immediate hard-delete sweep |
-
-**Pre-flight count:** get per-category sizes before any pass. Keep all categories below 300 (ideally below 200).
+Full details: `references/audit-procedures.md`.
 
 ---
 
@@ -621,7 +409,7 @@ Use only when content is factually correct but structurally unclear.
 
 When using an LLM to **decompose, extract, or synthesize** facts:
 
-**The hallucination risk is non-zero even on simple input.** An LLM can fabricate content not present in the source (e.g., inventing a "brother died" claim from an ambiguous identity fact). Trust=0.3 source material does NOT produce trust=0.3 atoms; it can produce confident hallucinations at trust=0.5.
+**The hallucination risk is non-zero even on simple input.** An LLM can fabricate content not present in the source. Trust=0.3 source material does NOT produce trust=0.3 atoms; it can produce confident hallucinations at trust=0.5.
 
 **Required workflow:**
 1. **Print raw first** — show LLM output verbatim before writing anything. Do not summarize or assure.
@@ -646,9 +434,9 @@ All scripts use MemoryStore shared connection and `--db` flag for testing.
 
 ## Common Pitfalls
 
-1. **Acting without asking.** One issue at a time unless the user approves bulk.
+1. **Acting without asking.** One issue at a time unless user approves bulk.
 
-2. **Verify bindings via `fact_entities`, never via content matching or `probe()`.** `LIKE '%EntityName%'` and `search()` produce false positives (e.g. an insurance tenant identifier in a tag, or an already-quoted entity). `probe("ConditionA")` returning a result does NOT prove correct binding — it may be high-confidence noise. The only reliable check is a `fact_entities` SQL JOIN row linking fact_id to entity_id.
+2. **Verify bindings via `fact_entities`, never via content matching or `probe()`.** `LIKE '%EntityName%'` and `search()` produce false positives. The only reliable check is a `fact_entities` SQL JOIN row linking fact_id to entity_id.
 
 3. **ALL CAPS / single-word capitalized entities fail `_RE_CAPITALIZED`.** The regex requires 2+ title-case words; `ConditionA`, `InsurerC`, `MedicationB`, `User` are invisible unless explicitly double-quoted. **Always quote single-word terms** — mandatory, not redundant.
 
@@ -662,29 +450,25 @@ All scripts use MemoryStore shared connection and `--db` flag for testing.
 
 8. **Forgetting category size.** Above 500 facts the contradiction gate is unreliable. Pre-flight per-category counts; keep below 300.
 
-9. **`update` recomputes on ANY content — no byte-equality skip.** `update_fact` guards on `if content is not None`, not on whether content changed. Passing byte-identical content DOES re-extract + rebuild HRR. The June-20 "no new bindings" result happened because the **same unquoted** text re-extracts deterministically to empty — to change bindings you must **ADD THE QUOTES**. This corrects earlier drafts (and former pitfalls 19/21) that claimed "identical content is a no-op for binding": the recompute is NOT skipped; identical unquoted text simply re-extracts to the same empty set.
+9. **`update` recomputes on ANY content — no byte-equality skip.** `update_fact` guards on `if content is not None`, not on whether content changed. Passing byte-identical content DOES re-extract + rebuild HRR. To change bindings you must **ADD THE QUOTES**.
 
-10. **Empty HRR vector = invisible to the bank.** `_rebuild_bank()` filters `WHERE hrr_vector IS NOT NULL`; null vectors are silently excluded (no error, empty probe results). Fix via `fact_store update` with current content; always route writes through `fact_store`, never direct SQL.
+10. **Empty HRR vector = invisible to the bank.** `_rebuild_bank()` filters `WHERE hrr_vector IS NOT NULL`; null vectors are silently excluded (no error, empty probe results). Fix via `fact_store update` with current content.
 
 11. **Invalid category values silently break category-scoped probe.** Schema enum allows only `user_pref/project/tool/general`. `financial`/`health` facts are accepted but never appear in category-scoped probe. Migrate to valid categories when found.
 
-12. **Kitchen-sink mega-bundles ≠ conceptual bundles.** A single 200+ word fact covering 10+ life domains (work, health, finances, tools, relationships, diet) is a failed synthesis — always atomize (with the LLM Synthesis Guard). Conceptual bundles (identity snapshot, medical protocol, system config, preference cluster) stay bundled.
+12. **Kitchen-sink mega-bundles ≠ conceptual bundles.** A single 200+ word fact covering 10+ life domains is a failed synthesis — always atomize (with the LLM Synthesis Guard). Conceptual bundles stay bundled.
 
 ---
 
 ## Verification Checklist
 
-- [ ] WAL lock check run — no gateway PID holding exclusive lock (or stale-lock verified)
-- [ ] Schema verification completed — tables/columns match `store.py`
-- [ ] **HRR bank integrity verified** — all `hrr_vector`s same byte length (hrr_dim × 8)
-- [ ] **No orphan `memory_banks` rows** — every bank_name has ≥1 fact
+- [ ] DB health pre-flight: MemoryStore connection verified, schema matches store.py
+- [ ] Entity health pre-flight: HRR vectors homogeneous + non-null, binding rates checked
 - [ ] Per-category fact counts reported before any pass
-- [ ] All 9 passes executed in order (0 Bank Repair → 1 Entity Extraction → 1b Bulk Binding → 2 Bundled → 3 Cohesion → 4 Tombstones → 5 Temporal → 6 Coreference → 7 Neglect → 8 Reranking Audit)
-- [ ] Pass 8: dry-run table presented and approved before any execution; sensitive-health facts marked HOLD; synthesis facts below 0.45 ceiling; career facts consolidated (not blindly demoted) after EmploymentTransition; wiki propagation + log.md audit trail (only if llm-wiki is installed)
+- [ ] All 9 passes executed in order (0 Bank Repair → 1 Entity Binding → 2 Bundled → 3 Cohesion → 4 Tombstones → 5 Temporal → 6 Coreference → 7 Neglect → 8 Reranking)
+- [ ] Pass 8: dry-run table presented and approved; sensitive-health facts held; synthesis facts below 0.45 ceiling
 - [ ] Pass 1 fixes verified via `fact_entities` JOIN / `probe()` before moving on
 - [ ] Bulk approvals confirmed with user
-- [ ] Entity alias pairs checked via dual-probe before migration
 - [ ] Category escalation reviewed — no category above 300
 - [ ] End-of-session summary delivered
-- [ ] No `execute_code sqlite3` writes — all writes via `fact_store`
-- [ ] No direct SQL on `facts` — orphan `memory_banks` cleanup is the only exception
+- [ ] No direct SQL writes — all writes via `fact_store`
