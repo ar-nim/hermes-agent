@@ -70,8 +70,8 @@ First action of every run, before Step 0: read `cron/deferred_reflect/state.json
 3. **Tags format (exact):** `status:current,type:synthesis,components:FID1,FID2,...,reflect-synthesis,entity1,entity2,...`. The `components:` segment is REQUIRED — it is the backreference Step 0 uses to detect staleness. If you forget it, refresh never triggers.
 4. **All single-word capitalized entities MUST be double-quoted** in content: `"ConditionA"`, `"MedicationB"`, `"InsurerC"`, `"CityX"`, `"User"`, `"GCP"`, `"LTVP"`, `"KTP"`, `"CommunityOrg"`, `"VenueX"`, `"ROM"`. Multi-word titlecase phrases (`"Teachers Day"`, `"Central Community Center"`) must be quoted as a unit. The FTS5 extraction in Step 3 uses both `quoted_re` and `titlecase_re`, so unquoted entities fail to cluster and the synthesis is orphaned from the entity graph.
 5. **Don't write facts that already exist.** Always run Step 5 FTS5/LIKE check first.
-6. **WAL lock handling:** if Step 6 hits `sqlite3.OperationalError` ("database is locked"), stop writes, save proposed syntheses to `cron/deferred_reflect/state.json` with `step: null`, report `[REFLECT] Deferred`. Do NOT loop-retry; the next cron tick resumes.
-7. **Step 6.5 HRR vectors are MANDATORY for new syntheses.** `compute_hrr_vectors.py` is required after Step 6. NOTE: `reflect_pipeline.py` currently hardcodes `HRR_DIM=4096`, but `hrr_dim` is config-settable (plugin default 1024) — the pipeline MUST read the configured value, not hardcode it. Facts with NULL HRR vectors are invisible to `probe()`/`reason()`. Step 6 entity extraction (via the synthesis dict's `entities` field) is the load-bearing step; Step 6.5 only computes the vector from those bindings.
+6. **WAL safety:** MemoryStore's shared connection pool (store.py:98-112) prevents cross-connection WAL contention. The reflect pipeline uses `MemoryStore` (not `sqlite3.connect`), so writes that previously failed with "database is locked" now succeed through the shared connection. If Step 6 nevertheless encounters a WAL contention, retry once; if it persists, this indicates a genuine gateway restart race — report and stop.
+7. **Step 6.5 HRR vectors are MANDATORY for new syntheses.** `compute_hrr_vectors.py` is required after Step 6. Facts with NULL HRR vectors are invisible to `probe()`/`reason()`. Step 6 entity extraction (via the synthesis dict's `entities` field) is the load-bearing step; Step 6.5 only computes the vector from those bindings. The reflect pipeline now reads `hrr_dim` from `store.hrr_dim` (configurable in config.yaml, default 1024) — never hardcoded.
 8. **Cursor write via Python file I/O**, not `terminal` echo (see Execution model). `HERMES_HOME` is not reliably inherited by background subshells in cron context.
 
 ## Pitfalls (read before running)
@@ -167,11 +167,11 @@ for entity, data in stats.items():
 deep_plan = plan_deep_session_calls(long_term)
 ```
 
-### P27. Gateway persistent WAL lock → remove SHM
-The hermes gateway holds persistent SQLite connections that block ALL writes (even the `sqlite3` CLI). Symptom: `database is locked` on every INSERT despite `timeout=30`. Workaround: `rm -f ~/.hermes/memory_store.db-shm` immediately before writes, then INSERT. If that fails (gateway re-locks), fall back to the deferred-state pattern.
+### P27. Gateway WAL contention — obsolete (MemoryStore handles it)
+The reflect pipeline now uses `MemoryStore` (shared connection with process-wide lock), not `sqlite3.connect()`. Cross-connection WAL contention is no longer possible under normal operation. If writes still fail with "database is locked", this is a genuine gateway restart race — report and stop. Do NOT `rm -f *.db-shm` (this is unnecessary and may corrupt an active transaction).
 
-### P28. `last_insert_rowid()` returns 0 via sqlite3 CLI
-When using the sqlite3 CLI as a WAL workaround, `SELECT last_insert_rowid()` returns `0` (each CLI call is a separate process). Get new IDs by querying recent rows instead:
+### P28. `last_insert_rowid()` returns 0 via sqlite3 CLI (no longer relevant — reflect uses MemoryStore)
+The reflect pipeline no longer uses the sqlite3 CLI for writes, so this pitfall does not apply. When using the sqlite3 CLI directly, `SELECT last_insert_rowid()` returns `0` (each CLI call is a separate process).
 ```sql
 SELECT fact_id, category, trust_score, substr(content,1,80) FROM facts ORDER BY fact_id DESC LIMIT 4;
 ```

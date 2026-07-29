@@ -87,13 +87,17 @@ fuser "$HERMES_HOME/memory_store.db"
 ls -la "$HERMES_HOME/memory_store.db-wal"
 ```
 
-**Stale WAL + new gateway PID = false positive.** A PID in `fuser` output does not always mean the gateway is actively writing. If the WAL timestamp predates the current gateway session, the lock may be stale. Always verify with a read-only query:
+**WAL safety with MemoryStore shared connection.** The holographic memory plugin (`store.py:98-112`) uses a process-wide shared connection pool. All `MemoryStore` instances for the same DB share ONE connection with a re-entrant lock — cross-connection WAL contention is impossible. Janitor audit scripts that open their own `sqlite3.connect()` with `PRAGMA query_only=ON` are still safe (WAL allows concurrent readers), but prefer the shared connection when writing. See `reflect_pipeline.get_store()` for the canonical pattern.
+
+**Stale WAL + new gateway PID = false positive.** A PID in `fuser` output does not always mean the gateway is actively writing. If the WAL timestamp predates the current gateway session, the lock may be stale. Always verify with a MemoryStore read-only query:
 ```bash
 python3 -c "
-import sqlite3, os
-conn = sqlite3.connect(os.environ.get('HERMES_HOME', os.path.expanduser('~/.hermes')) + '/memory_store.db')
-conn.execute('PRAGMA query_only=ON')
-print('READ OK,', conn.execute('SELECT COUNT(*) FROM facts').fetchone()[0], 'facts')
+from store import MemoryStore
+import os
+store = MemoryStore()
+count = store._conn.execute('SELECT COUNT(*) FROM facts').fetchone()[0]
+print('READ OK,', count, 'facts')
+store.close()
 "
 ```
 If the read succeeds → WAL is stale; proceed. If it fails with `database is locked` → gateway holds exclusive write lock → tell user to restart gateway, wait, retry.
@@ -111,12 +115,13 @@ skill_view(name='holographic-memory-best-practices')
 
 Verify the actual DB schema matches `store.py` before starting. All janitor recommendations (hard deletes, deprecations, splits) depend on the schema behaving as expected.
 ```python
-import sqlite3, subprocess
-db_path = os.environ.get('HERMES_HOME', os.path.expanduser('~/.hermes')) + '/memory_store.db'
-result = subprocess.run(['file', db_path], capture_output=True, text=True)
-# SQLite → "SQLite 3.x database" (usable). DuckDB → "DuckDB database file, version 64" (wrong file)
-conn = sqlite3.connect(db_path)
-conn.execute('PRAGMA query_only=ON')
+from store import MemoryStore
+import os
+store = MemoryStore()
+rows = store._conn.execute("SELECT sql FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+for r in rows:
+    print(r[0])
+store.close()
 ```
 **Critical path distinction:** always use `$HERMES_HOME/memory_store.db` (SQLite) in cron. The `DuckDB` file at a different path yields "Table with name facts does not exist".
 
@@ -182,12 +187,12 @@ conn.commit()
 
 ## DB Access Rules
 
-- The gateway holds a persistent connection with exclusive write lock.
-- **All writes** → `fact_store` tool (uses gateway's own connection, available in interactive sessions).
-- **Simple reads (probe, search)** → `fact_store` tool.
-- **Cron environment reads** → `terminal` with `python3` + `sqlite3` (direct SQLite). The `sqlite3` CLI is a standalone binary, not flagged as script execution — preferred for single-statement queries.
-- **Cron execution pattern blocks (verified):** `execute_code`, inline `python3 -c`, and `rm /tmp/...` are BLOCKED in cron. Use `sqlite3 $HERMES_HOME/.hermes/memory_store.db "SQL"` or write a script to `/tmp/x.py` and run `python3 /tmp/x.py`.
-- **WAL lock:** see the WAL pre-flight — never restart the gateway yourself.
+- **MemoryStore shared connection** — the holographic memory plugin (store.py:98-112) uses a process-wide shared connection pool. All MemoryStore instances share ONE connection with a re-entrant lock, eliminating cross-connection WAL contention. The gateway, janitor scripts, and reflect pipeline all join this pool when they use get_store() / MemoryStore(db_path=...).
+- **All writes** → fact_store tool (uses gateway's own connection, available in interactive sessions).
+- **Simple reads (probe, search)** → fact_store tool.
+- **Cron environment reads** → terminal with sqlite3 CLI or a MemoryStore script (preferred). The sqlite3 CLI is a standalone binary, not flagged as script execution.
+- **Cron execution pattern blocks (verified):** execute_code, inline python3 -c, and rm /tmp/... are BLOCKED in cron. Use sqlite3 $HERMES_HOME/.hermes/memory_store.db "SQL" or write a script to /tmp/x.py and run python3 /tmp/x.py.
+- **WAL safety:** the shared connection eliminates cross-process WAL contention (see WAL pre-flight section above). Never restart the gateway yourself.
 - **Two-phase fix for entity quoting:** Phase 1 (bulk quoting via SQLite SQL) computes new quoted content strings for all unbound facts; Phase 2 (`fact_store update` per fact) is mandatory — it triggers `_extract_entities()` AND `_compute_hrr_vector()`. Never skip Phase 2 (`fact_entities` and `hrr_vector` are separate; correct links without a fresh HRR vector still score poorly). The UNIQUE constraint hazard: if two facts share content after quoting, differentiate (append a parenthetical) before updating both.
 - **Exception — Pass 1 discovery only:** the entity density JOIN query has no built-in tool equivalent; `execute_code` is acceptable strictly for discovery, not verification or fixes.
 
@@ -409,9 +414,9 @@ Action needed: YES to add binding / NO to skip
 
 ### Pass 7: Neglect Detection (retrieval_count Awareness)
 
-**Purpose:** Identify facts never retrieved since PR #73901 deployed (`retrieval_count` increments on search/probe/related/reason — observability ONLY, never scoring/ranking). These facts may need HRR recompute, entity re-quoting, or pruning.
+**Purpose:** Identify facts never retrieved (`retrieval_count` increments on search/probe/related/reason — observability ONLY, never scoring/ranking). These facts may need HRR recompute, entity re-quoting, or pruning.
 
-**Prerequisite:** PR #73901 deployed — `sqlite3 $HERMES_HOME/memory_store.db "SELECT MAX(retrieval_count) FROM facts"` should be > 0. Do NOT run immediately after deployment; wait days for signal to accumulate.
+**Prerequisite:** `retrieval_count` must be incrementing (confirm via `SELECT MAX(retrieval_count) FROM facts` > 0). If zero on all facts, the PR #73901 fix may not be deployed — skip this pass.
 
 **Procedure:**
 ```bash
@@ -419,7 +424,7 @@ sqlite3 $HERMES_HOME/memory_store.db "SELECT fact_id, category, trust_score, ret
 ```
 For each zero-retrieval fact, diagnose: entity not quoted? (recommend `fact_store update` with quotes); content too generic? (split/rephrase); wrong category?; truly irrelevant? (`fact_feedback unhelpful` or remove). Also check high-trust zero-retrieval facts (may be over-trusted).
 
-**What NOT to do:** do NOT bulk-remove zero-retrieval facts (binding may be broken, not content); do NOT auto-adjust trust (present to user); do NOT run right after deployment.
+**What NOT to do:** do NOT bulk-remove zero-retrieval facts (binding may be broken, not content); do NOT auto-adjust trust (present to user).
 
 **Interpretation:**
 - `retrieval_count = 0` after 30+ days → genuinely neglected, review content.
@@ -649,7 +654,7 @@ When using an LLM to **decompose, extract, or synthesize** facts:
 
 5. **UNIQUE constraint on duplicate-content `update`.** When two facts share content, updating one to add quotes collides with the other (`content` is UNIQUE). Differentiate first (append a parenthetical), then update both.
 
-6. **WAL lock check — never restart the gateway.** A PID in `fuser` output may be a stale WAL file (timestamp predates the current gateway session). Verify with a `PRAGMA query_only=ON` read; if it succeeds, the lock is stale and you may proceed. A genuine lock → tell the user, wait for restart, retry.
+6. **WAL safety check.** The MemoryStore shared connection (store.py:98-112) prevents cross-connection WAL contention under normal operation. If opening a raw connection, verify with PRAGMA query_only=ON first. A genuine lock (from a gateway restart race) → tell the user, never restart the gateway.
 
 7. **Tombstones (0.3) are passive, not a cleanup queue.** Only act with a concrete reason (duplicate, confirmed error, merge). Pre-compute deprecation cascade: each `unhelpful` subtracts 0.10, so prefer `fact_store update(fact_id, trust_delta=-X)` to set the target directly.
 
