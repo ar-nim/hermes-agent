@@ -161,15 +161,16 @@ python3 scripts/check_hrr_health.py   # → "All vectors homogeneous and non-nul
 
 **Diagnosis:** run `check_entity_bindings.py` to identify store-derived entities with low binding rates. Also scan for zero-entity facts:
 ```python
-import sqlite3, os
-conn = sqlite3.connect(os.environ.get('HERMES_HOME', os.path.expanduser('~/.hermes')) + '/memory_store.db')
-conn.row_factory = sqlite3.Row
-for cat in ('user_pref', 'general', 'tool', 'project'):
-    rows = conn.execute("""SELECT f.fact_id, f.content FROM facts f
-        LEFT JOIN fact_entities fe ON fe.fact_id = f.fact_id
-        WHERE f.category=? AND f.hrr_vector IS NOT NULL AND fe.fact_id IS NULL
-        ORDER BY f.fact_id""", (cat,)).fetchall()
-    print(f"{cat}: {len(rows)} zero-entity facts")
+from store import MemoryStore
+store = MemoryStore()
+with store._lock:
+    for cat in ('user_pref', 'general', 'tool', 'project'):
+        rows = store._conn.execute("""SELECT f.fact_id, f.content FROM facts f
+            LEFT JOIN fact_entities fe ON fe.fact_id = f.fact_id
+            WHERE f.category=? AND f.hrr_vector IS NOT NULL AND fe.fact_id IS NULL
+            ORDER BY f.fact_id""", (cat,)).fetchall()
+        print(f"{cat}: {len(rows)} zero-entity facts")
+store.close()
 ```
 
 **Problem:** Unquoted entities are never extracted by `_extract_entities()` — they get zero HRR binding. Every fact containing an important entity must quote it in its content. Single-word capitalized / ALL CAPS terms (`User`, `ConditionA`, `MedicationB`, `InsurerC`, `LocalTZ`) are NOT auto-extracted by `_RE_CAPITALIZED` (requires 2+ title-case words) — they must be explicitly double-quoted.
@@ -210,15 +211,16 @@ for cat in ('user_pref', 'general', 'tool', 'project'):
 
 **FTS drift check:**
 ```python
-import sqlite3, os
-conn = sqlite3.connect(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")) + "/memory_store.db")
-conn.execute('PRAGMA query_only=ON')
+from store import MemoryStore
+store = MemoryStore()
+conn = store._conn
 total_facts = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
 total_fts = conn.execute("SELECT COUNT(*) FROM facts_fts").fetchone()[0]
 drift = total_fts - total_facts
 orphaned = conn.execute("SELECT COUNT(*) FROM facts_fts fts LEFT JOIN facts f ON fts.rowid=f.fact_id WHERE f.fact_id IS NULL").fetchone()[0]
 missing = conn.execute("SELECT COUNT(*) FROM facts f LEFT JOIN facts_fts fts ON f.fact_id=fts.rowid WHERE fts.rowid IS NULL").fetchone()[0]
 print(f"Drift: {drift}, Orphaned FTS: {orphaned}, Missing FTS: {missing}")
+store.close()
 ```
 **Acceptable state:** drift = 0, orphaned = 0, missing = 0. If drift found, report to user; FTS rebuild requires gateway restart.
 
@@ -283,7 +285,14 @@ Action needed: YES to apply / NO to skip
 
 **Procedure:**
 ```bash
-sqlite3 $HERMES_HOME/memory_store.db "SELECT fact_id, category, trust_score, retrieval_count, length(content), substr(content,1,80) AS preview FROM facts WHERE retrieval_count=0 ORDER BY created_at ASC LIMIT 20;"
+python3 -c "
+from store import MemoryStore
+store = MemoryStore()
+rows = store._conn.execute('SELECT fact_id, category, trust_score, retrieval_count, length(content), substr(content,1,80) AS preview FROM facts WHERE retrieval_count=0 ORDER BY created_at ASC LIMIT 20').fetchall()
+for r in rows:
+    print(f'  #{r[\"fact_id\"]} cat={r[\"category\"]} trust={r[\"trust_score\"]:.2f} rc={r[\"retrieval_count\"]} {r[\"preview\"]}')
+store.close()
+"
 ```
 For each zero-retrieval fact, diagnose: entity not quoted? (recommend `fact_store update` with quotes); content too generic? (split/rephrase); wrong category?; truly irrelevant? (`fact_feedback unhelpful` or remove). Also check high-trust zero-retrieval facts (may be over-trusted).
 

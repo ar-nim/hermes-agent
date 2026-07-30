@@ -44,10 +44,8 @@ MIN_FACTS = 3  # frequency floor — entity must be bound in >= 3 facts
 
 
 def get_store(db_path=None):
-    """Get a MemoryStore using the plugin's shared connection."""
+    """Get a MemoryStore using the plugin's db_path resolution."""
     from store import MemoryStore
-    if db_path is None:
-        db_path = str(HERMES_HOME / "memory_store.db")
     return MemoryStore(db_path=db_path)
 
 
