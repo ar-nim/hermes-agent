@@ -28,16 +28,16 @@ def get_store(db_path=None):
     """
     Get a MemoryStore instance using the plugin's shared connection.
 
-    Use this instead of sqlite3.connect() to join the plugin's connection pool
-    and avoid WAL lock contention (the shared pool eliminates cross-connection
-    contention; see store.py:98-112).
+    Uses the plugin's own db_path resolution (get_hermes_home() →
+    config.yaml override), NOT os.environ["HERMES_HOME"]. This is
+    critical for multi-profile setups where the env var may point to
+    the default profile instead of the active one.
 
     Args:
-        db_path: override DB path. Defaults to HERMES_HOME/memory_store.db
+        db_path: explicit override (for testing). If None, MemoryStore
+                 resolves via get_hermes_home().
     """
     from store import MemoryStore
-    if db_path is None:
-        db_path = os.path.join(HERMES_HOME, "memory_store.db")
     return MemoryStore(db_path=db_path)
 
 
